@@ -27,6 +27,9 @@ from aqt.common import aqt_config
 import tensorflow.compat.v1 as tf
 import tensorflow.compat.v1.tpu as tpu_ops
 
+from google3.platforms.deepsea.ffds.reduced_precision import emulated_floating_points
+from google3.platforms.deepsea.ffds.reduced_precision import emulation_utils
+
 
 # For compatibility with different frameworks, such as Babelfish, we allow
 # custom variable creation lambdas. Make sure they're not trainable.
@@ -46,6 +49,70 @@ def default_get_variable(name: str, shape: Iterable[int],
       trainable=False,
       initializer=initializer,
       use_resource=True)
+
+
+def _no_quantization_or_emulation(config: aqt_config.AqtTensorConfig) -> bool:
+  if isinstance(config.quant_config, aqt_config.IntQuantConfig):
+    return False
+  elif config.quant_config.emulated_format:
+    return False
+  else:
+    return True
+
+
+def _emulated_fp(
+    t: tf.Tensor,
+    mantissa_bits: tf.Tensor,
+    min_exp: tf.Tensor,
+    max_exp: tf.Tensor,
+) -> tf.Tensor:
+  """Emulates enumerics in bfloat16 or float32 given the FPMetadata.
+
+  This is based on the implementation in:
+  google3/platforms/deepsea/ffds/reduced_precision/emulated_floating_points.py
+  However a separate implementation is needed to incorporate the metadata as
+  tensors in the TF graph.
+
+  Args:
+    t: a tensor whose dtype is either tf.bfloat16 or tf.float32.
+    mantissa_bits: The mantissa bits in the emulated format.
+    min_exp: the allowed minimum exponents in the emulated format.
+    max_exp: the allowed maximum exponents in the emulated format.
+
+  Returns:
+    a same dtype tensor that emulates floating points.
+  """
+  assert t.dtype in [tf.bfloat16, tf.float32]
+  output_type = t.dtype
+  t = tf.cast(t, tf.float32)
+
+  with tf.name_scope('emulated_fp'):
+    v = emulated_floating_points.handle_mantissa(
+        t,
+        mantissa_bits=mantissa_bits,
+        min_exp=min_exp,
+        rounding_mode=emulation_utils.ROUND_TO_NEAREST_EVEN)
+    v = emulated_floating_points.static_handle_exponent(
+        v,
+        min_exp=min_exp - mantissa_bits,
+        max_exp=max_exp,
+        mantissa_bits=mantissa_bits)
+    return tf.cast(v, output_type)
+
+
+def _get_max_number(mantissa_bits: tf.Tensor, max_exp: tf.Tensor) -> tf.Tensor:
+  """Returns the maximum possible number (not inf) allowed by the format."""
+  return (2**max_exp) * emulation_utils.get_possible_mantissa_values(
+      mantissa_bits)[-1]
+
+
+def _get_clip_bound(config: aqt_config.AqtTensorConfig) -> tf.Tensor:
+  if isinstance(config.quant_config, aqt_config.IntQuantConfig):
+    return aqt_common.get_clip_bound(config.quant_config)
+  else:  # FP8 emulation
+    return _get_max_number(
+        mantissa_bits=config.quant_config.emulated_format.mantissa_bits,
+        max_exp=config.quant_config.emulated_format.max_exp)
 
 
 class Stats:
@@ -187,7 +254,7 @@ def _should_update_scale(
     prev_event_count: tf.Tensor,
     new_event_count: tf.Tensor) -> tf.Tensor:
   """Returns if scale should be updated for the config and event count."""
-  if isinstance(config.quant_config, aqt_config.FloatConfig):
+  if _no_quantization_or_emulation(config):
     return tf.constant(False)
 
   if not config.freeze_scale_at_begin:
@@ -291,14 +358,15 @@ class TensorQuantizer:
       self, config: aqt_config.AqtTensorConfig
   ) -> Tuple[tf.Tensor, tf.Tensor]:
     """Returns new scale, inverse scale for a given config and stats, if any."""
-    if isinstance(config.quant_config, aqt_config.FloatConfig):
-      # We shouldn't update the scale if the given config contains FloatConfig;
+    if _no_quantization_or_emulation(config):
+      # We shouldn't update the scale if the given config contains FloatConfig
+      # and no emulation;
       # fill with a poison value if we get into this situation.
       nan = tf.constant(float('nan'), tf.float32, self._stats.stats_shape)
       return nan, nan
 
     x_bound = self._stats.bound(config.calibration_config)
-    clip_bound = aqt_common.get_clip_bound(config.quant_config)
+    clip_bound = _get_clip_bound(config)
 
     new_scale = clip_bound / x_bound
     inv_scale = x_bound / clip_bound
@@ -308,7 +376,7 @@ class TensorQuantizer:
     """Returns the tensor clip range or zeros if no int config is active."""
 
     def case_fn(config: aqt_config.AqtTensorConfig) -> tf.Tensor:
-      if not isinstance(config.quant_config, aqt_config.IntQuantConfig):
+      if _no_quantization_or_emulation(config):
         return tf.zeros(self._stats.stats_shape)
 
       # We return the range derived from the inverse scale, rather than
@@ -318,7 +386,7 @@ class TensorQuantizer:
       # The counterfactual clipping range that would have been used
       # if we didn't freeze the scale can be re-derived from the current
       # stats values, which are updated regardless of freezing.
-      clip_bound = aqt_common.get_clip_bound(config.quant_config)
+      clip_bound = _get_clip_bound(config)
       return self._inv_scale.read_value() * clip_bound
 
     return self._config_case(case_fn, self._last_update.read_value())
@@ -406,73 +474,107 @@ class TensorQuantizer:
     def qparams(
         config: aqt_config.AqtTensorConfig,
         check_active: bool = True
-    ) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
+    ) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor,
+               tf.Tensor, tf.Tensor]:
       """Returns quant parameters for fixed AQT config."""
 
+      # Used for int quantization
       should_quantize = tf.constant(0.0)
       clip_bound = tf.constant(0.0)
       shift_before = tf.constant(0.0)
       shift_after = tf.constant(0.0)
 
+      # Used for fp8 emulation
+      should_emulate = tf.constant(0, dtype=tf.int32)
+      mantissa_bits = tf.constant(0, dtype=tf.int32)
+      min_exp = tf.constant(0, dtype=tf.int32)
+      max_exp = tf.constant(0, dtype=tf.int32)
+
       config_active = is_config_active(config, self._last_update.read_value())
       config_active = not check_active or config_active
 
-      if isinstance(config.quant_config, aqt_config.FloatConfig):
+      if _no_quantization_or_emulation(config):
         clip_bound = tf.where_v2(config_active, float('inf'), 0.0)
-        return should_quantize, clip_bound, shift_before, shift_after
+      elif isinstance(config.quant_config, aqt_config.IntQuantConfig):
+        config_active = tf.cast(config_active, tf.float32)
+        should_quantize += config_active
 
-      config_active = tf.cast(config_active, tf.float32)
-      should_quantize += config_active
+        # TODO(vladf): some serving environments, such as adbrain,
+        # automatically rewrite constants from f32 to bf16, which makes the
+        # epsilon used in the function below invalid, so that
+        # safe_clip_bound == clip_bound (incorrectly). We should solve for
+        # that through some configuration.
+        clip_bound += config_active * aqt_common.safe_clip_bound(
+            config.quant_config)
+        if config.quant_config.preserve_zero:
+          shift_before += config_active * 0.5
+        else:
+          shift_after += config_active * 0.5
+      else:  # emulation
+        config_active = tf.cast(config_active, tf.int32)
+        should_emulate += config_active
 
-      # TODO(vladf): some serving environments, such as adbrain,
-      # automatically rewrite constants from f32 to bf16, which makes the
-      # epsilon used in the function below invalid, so that
-      # safe_clip_bound == clip_bound (incorrectly). We should solve for
-      # that through some configuration.
-      clip_bound += config_active * aqt_common.safe_clip_bound(
-          config.quant_config)
+        clip_bound += tf.cast(config_active,
+                              tf.float32) * _get_clip_bound(config)
 
-      if config.quant_config.preserve_zero:
-        shift_before += config_active * 0.5
-      else:
-        shift_after += config_active * 0.5
+        mantissa_bits += (
+            config_active * config.quant_config.emulated_format.mantissa_bits)
+        min_exp += config_active * config.quant_config.emulated_format.min_exp
+        max_exp += config_active * config.quant_config.emulated_format.max_exp
 
-      return should_quantize, clip_bound, shift_before, shift_after
+      return (should_quantize, clip_bound, shift_before, shift_after,
+              should_emulate, mantissa_bits, min_exp, max_exp)
 
     if not train and self.config.inference_config_index is not None:
-      should_quantize, clip_bound, shift_before, shift_after = qparams(
-          self.config.tensor_configs[self.config.inference_config_index],
-          check_active=False)
+      (should_quantize, clip_bound, shift_before, shift_after, should_emulate,
+       mantissa_bits, min_exp, max_exp) = qparams(
+           self.config.tensor_configs[self.config.inference_config_index],
+           check_active=False)
     elif self.config.tensor_configs:
-      should_quantize, clip_bound, shift_before, shift_after = zip(
-          *map(qparams, self.config.tensor_configs))
+      (should_quantize, clip_bound, shift_before, shift_after, should_emulate,
+       mantissa_bits, min_exp,
+       max_exp) = zip(*map(qparams, self.config.tensor_configs))
       should_quantize = tf.add_n(should_quantize)
       clip_bound = tf.add_n(clip_bound)
       shift_before = tf.add_n(shift_before)
       shift_after = tf.add_n(shift_after)
+
+      should_emulate = tf.add_n(should_emulate)
+      mantissa_bits = tf.add_n(mantissa_bits)
+      min_exp = tf.add_n(min_exp)
+      max_exp = tf.add_n(max_exp)
     else:
-      should_quantize = clip_bound = shift_before = shift_after = tf.constant(
+      should_quantize = clip_bound = shift_before = shift_after = should_emulate = mantissa_bits = min_exp = max_exp = tf.constant(
           0.0)
 
     should_quantize = tf.cast(should_quantize, tf.bool)
-    return should_quantize, clip_bound, shift_before, shift_after
+    should_emulate = tf.cast(should_emulate, tf.bool)
+    return (should_quantize, clip_bound, shift_before, shift_after,
+            should_emulate, mantissa_bits, min_exp, max_exp)
 
   def _to_quant(self, x: tf.Tensor, train: bool) -> tf.Tensor:
     """Quantizes x with active quant config, if any, else act as identity."""
-    should_quantize, clip_bound, shift_before, shift_after = (
-        self._quantization_params(train))
+    with tf.variable_scope('to_quant'):
+      (should_quantize, clip_bound, shift_before, shift_after, should_emulate,
+       mantissa_bits, min_exp, max_exp) = (
+           self._quantization_params(train))
 
-    maybe_floor = (
-        lambda y: tf.where_v2(should_quantize, tf.math.floor(y), y))
+      def maybe_floor_or_reduced_precision(y):
+        if self.config.emulation_mode:
+          return tf.where_v2(
+              should_emulate,
+              _emulated_fp(y, mantissa_bits, min_exp, max_exp), y)
+        else:
+          return tf.where_v2(should_quantize, tf.math.floor(y), y)
 
-    # Note that backprop does not depend directly on the value of _last_update
-    # or any_config_active; only scales and constants need to be maintained
-    # and there's no branching on ops including the input tensor x. This
-    # results in significant memory reduction, see cl/415355150.
-    x = tf.clip_by_value(x, -clip_bound, clip_bound)
-    x += shift_before
-    x = tf.grad_pass_through(maybe_floor)(x)
-    x += shift_after
+      # Note that backprop does not depend directly on the value of _last_update
+      # or any_config_active; only scales and constants need to be maintained
+      # and there's no branching on ops including the input tensor x. This
+      # results in significant memory reduction, see cl/415355150.
+      x = tf.clip_by_value(x, -clip_bound, clip_bound)
+      x += shift_before
+      x = tf.grad_pass_through(maybe_floor_or_reduced_precision)(x)
+      x += shift_after
 
     return x
 
@@ -482,7 +584,7 @@ class TensorQuantizer:
     # computation in _to_quant to derive this clip mask instead of a separate
     # method.
     with tf.variable_scope('clip_mask'):
-      _, clip_bound, _, _ = (self._quantization_params(train))
+      _, clip_bound, _, _, _, _, _, _ = self._quantization_params(train)
       return tf.abs(x) > clip_bound
 
   def _get_quant_scale(self, train: bool) -> tf.Tensor:
@@ -491,12 +593,11 @@ class TensorQuantizer:
       inference_config = self.config.tensor_configs[
           self.config.inference_config_index]
       should_quantize = tf.constant(
-          isinstance(inference_config.quant_config,
-                     aqt_config.IntQuantConfig))
+          not _no_quantization_or_emulation(inference_config))
     else:
       should_quantize = tf.constant(False)
       for config in self.config.tensor_configs:
-        if isinstance(config.quant_config, aqt_config.FloatConfig):
+        if _no_quantization_or_emulation(config):
           continue
 
         config_active = is_config_active(config, self._last_update)

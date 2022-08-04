@@ -62,8 +62,8 @@ class EmulatedFormat(_BaseConfig):
   mantissa_bits: int
   min_exp: int
   max_exp: int
-  support_inf: bool
-  rounding_mode: RoundingMode
+  support_inf: bool  # Not yet supported
+  rounding_mode: RoundingMode  # Currently only using ROUND_TO_NEAREST_EVEN
 
 
 @dataclasses.dataclass
@@ -218,7 +218,18 @@ class AqtTensorConfig(_BaseConfig):
     if not isinstance(self.quant_config, IntQuantConfig) and not isinstance(
         self.quant_config, FloatConfig):
       raise ConfigError(
-          'quant_config must be one of {int_quant_config, float_config}.')
+          'quant_config must be one of {int_quant_config, float_config}.'
+      )
+    if (isinstance(self.quant_config, FloatConfig) and
+        self.quant_config.emulated_format):
+      emulated_format = self.quant_config.emulated_format
+      if emulated_format.support_inf:
+        raise NotImplementedError('Using emulated_format.support_inf '
+                                  'is not yet supported.')
+      if emulated_format.rounding_mode != RoundingMode.ROUND_TO_NEAREST_EVEN:
+        raise NotImplementedError(
+            'Using emulated_format.rounding_mode '
+            'only currently supports ROUND_TO_NEAREST_EVEN.')
 
   def to_dict(self) -> Dict[str, Any]:
     # AqtTensorConfig dataclass does not have `int_quant_config` and
@@ -249,11 +260,14 @@ class AqtScheduleConfig(_BaseConfig):
       allows for static switching logic at inference time, which improves
       throughput. If None, then the most recently trained-on config is the one
       that's used.
+    emulation_mode: Whether to use emulation or quantization. Will be picked
+      automatically when running validate, or raise an error.
   """
   stats_config: StatsConfig
   tensor_configs: List[AqtTensorConfig]
   use_quantized_variable: bool = False
   inference_config_index: Optional[int] = None
+  emulation_mode: bool = False
 
   def validate(self, data_shape: List[Optional[int]]):
     """Validates this AqtScheduleConfig for the provided data shape."""
@@ -267,6 +281,20 @@ class AqtScheduleConfig(_BaseConfig):
           f'inference_config_index ({self.inference_config_index}) must be '
           'at least 0 and less than len(tensor_configs) '
           f'({len(self.tensor_configs)})')
+
+    has_quantization = False
+    has_fp_emulation = False
+    for tensor_config in self.tensor_configs:
+      quant_config = tensor_config.quant_config
+      if isinstance(quant_config, IntQuantConfig):
+        has_quantization = True
+      elif (isinstance(quant_config, FloatConfig) and
+            quant_config.emulated_format):
+        has_fp_emulation = True
+    if has_quantization and has_fp_emulation:
+      raise ConfigError('Found both quantization and fp_emulation configs. '
+                        'Only one should be specified among all configs.')
+    self.emulation_mode = has_fp_emulation  # If false enable quantization.
 
   def fill_gaps_with_float_config(self):
     """Fills gaps with FloatConfig to always have one active config."""
