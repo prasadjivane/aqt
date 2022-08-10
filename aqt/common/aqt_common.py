@@ -49,8 +49,9 @@ def check_shapes_conformal(actual: Sequence[Optional[int]],
 
 
 def get_clip_bound(config: aqt_config.IntQuantConfig) -> float:
-  config.validate()
-  assert config.bits <= 23, 'Too many bits, float32 has less precision.'
+  # In some use cases, bits can be non-int, e.g. tf. Tensor
+  if isinstance(config.bits, int):
+    config.validate()
   bucket_count = 2.0**config.bits
   if config.preserve_zero:
     bucket_count -= 1.0
@@ -83,5 +84,7 @@ def safe_clip_bound(config: aqt_config.IntQuantConfig) -> float:
   # accomplishes this. On the other hand, any eps above bucket resolution
   # 2**(-config.bits) would overcorrect, underutilizing integer range.
   cb = cb_unsafe - 2.0**(-20 + config.bits)
-  assert cb < cb_unsafe, 'Internal error, epsilon too small.'
+  # In some use cases, bits can be non-int, e.g. tf. Tensor
+  if isinstance(config.bits, int):
+    assert cb < cb_unsafe, 'Internal error, epsilon too small.'
   return cb

@@ -156,12 +156,18 @@ class IntQuantConfig(_BaseConfig):
       Whether or not zeros should be representable.
   """
   # pyformat: enable
+  # Minimum and maximum supported quantized bits
+  MIN_BITS = 1
+  MAX_BITS = 23  # fractional bitwidth of Float32
+
   bits: int
   preserve_zero: bool = True
 
   def validate(self):
-    if self.bits < 1:
-      raise ConfigError(f'expected bits={self.bits} > 0')
+    if not IntQuantConfig.MIN_BITS <= self.bits <= IntQuantConfig.MAX_BITS:
+      raise ConfigError(f'bits={self.bits} must be in '
+                        f'[{IntQuantConfig.MIN_BITS}, '
+                        f'{IntQuantConfig.MAX_BITS}]')
 
   def compatible_with_int8(self) -> bool:
     """Checks if the config is compatible with int8."""

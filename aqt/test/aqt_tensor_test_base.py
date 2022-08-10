@@ -97,6 +97,18 @@ class AqtTensorQuantizerTest(tf.test.TestCase, parameterized.TestCase):
       config.use_quantized_variable = True
       self.make_tensor_quantizer(data_shape=[3, None], config=config)
 
+  def test_validates_bits_on_clip(self):
+    """Check that validate is appropriately called for int bits."""
+
+    # Bits validation delayed till`get_clip_bound`
+    with self.assertRaises(aqt_config.ConfigError):
+      iqc = aqt_config.IntQuantConfig(bits=-1, preserve_zero=True)
+      aqt_common.get_clip_bound(iqc)
+
+    with self.assertRaises(aqt_config.ConfigError):
+      iqc = aqt_config.IntQuantConfig(bits=25, preserve_zero=True)
+      aqt_common.get_clip_bound(iqc)
+
   def test_validates_shape_update(self):
     """Check that update() validates input tensor shapes."""
     sc = aqt_config.StatsConfig(

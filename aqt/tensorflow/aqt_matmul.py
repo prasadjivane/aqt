@@ -176,10 +176,13 @@ def _matmul_case(lhs_quantizer, rhs_quantizer, lhs, rhs, train):
   rhs_configs = rhs_quantizer.config.tensor_configs
 
   def is_int8_compatible(lhs_config, rhs_config):
-    return (isinstance(lhs_config.quant_config, aqt_config.IntQuantConfig) and
-            isinstance(rhs_config.quant_config, aqt_config.IntQuantConfig) and
-            lhs_config.quant_config.bits <= 8 and
-            rhs_config.quant_config.bits <= 8)
+    is_compatible = tf.constant(False)
+    if (isinstance(lhs_config.quant_config, aqt_config.IntQuantConfig) and
+        isinstance(rhs_config.quant_config, aqt_config.IntQuantConfig)):
+      lhs_less_than = tf.less_equal(lhs_config.quant_config.bits, 8)
+      rhs_less_than = tf.less_equal(rhs_config.quant_config.bits, 8)
+      is_compatible |= (lhs_less_than & rhs_less_than)
+    return is_compatible
 
   lhs_index = lhs_quantizer.config.inference_config_index
   rhs_index = rhs_quantizer.config.inference_config_index
@@ -189,15 +192,13 @@ def _matmul_case(lhs_quantizer, rhs_quantizer, lhs, rhs, train):
     for lhs_config in lhs_configs:
       for rhs_config in rhs_configs:
         # If any of lhs and rhs is FloatConfig, use the default matmul.
-        if is_int8_compatible(lhs_config, rhs_config):
-          should_int8_quantize |= (
-              aqt_tensor.is_config_active(lhs_config,
-                                          lhs_quantizer._last_update)
-              & aqt_tensor.is_config_active(rhs_config,
-                                            rhs_quantizer._last_update))
+        should_int8_quantize |= is_int8_compatible(lhs_config, rhs_config) & (
+            aqt_tensor.is_config_active(lhs_config, lhs_quantizer._last_update)
+            & aqt_tensor.is_config_active(rhs_config, rhs_quantizer._last_update))  # pylint: disable=line-too-long
+
   else:
-    should_int8_quantize = tf.constant(
-        is_int8_compatible(lhs_configs[lhs_index], rhs_configs[rhs_index]))
+    should_int8_quantize = is_int8_compatible(lhs_configs[lhs_index],
+                                              rhs_configs[rhs_index])
 
   # Use go/tf-control-flow-v2, which we've noticed fuses better on TPU XLA.
   v2_was_enabled = tf.control_flow_v2_enabled()

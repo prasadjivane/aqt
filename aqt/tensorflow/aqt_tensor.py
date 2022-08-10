@@ -298,8 +298,14 @@ class TensorQuantizer:
       return nan, nan
 
     x_bound = self._stats.bound(config.calibration_config)
+    # Zeros common in integration with channel pruning or oneshot search
+    # tensor masking, in which case, x_bound can be set to arbitrary non-zero
+    # value to avoid division by zero. If x_bound is zero, then all values in
+    # shared volume should be zero and bound is arbitrary. Set to 1 here
+    x_bound = tf.where_v2(x_bound > 0, x_bound, 1)
     clip_bound = aqt_common.get_clip_bound(config.quant_config)
 
+    # x_bound forced to be != 0 and clip_bound guaranteed != 0 by its formula
     new_scale = clip_bound / x_bound
     inv_scale = x_bound / clip_bound
     return new_scale, inv_scale

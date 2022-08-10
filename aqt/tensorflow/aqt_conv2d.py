@@ -47,13 +47,16 @@ def _assert_dilation_argument(lhs_quantizer, rhs_quantizer, dilations):
   is_valid = tf.constant(True)
   for lhs_config, rhs_config in zip(lhs_configs, rhs_configs):
     if (isinstance(lhs_config.quant_config, aqt_config.IntQuantConfig) and
-        isinstance(rhs_config.quant_config, aqt_config.IntQuantConfig) and
-        lhs_config.quant_config.bits <= 8 and
-        rhs_config.quant_config.bits <= 8):
+        isinstance(rhs_config.quant_config, aqt_config.IntQuantConfig)):
+      lhs_less_than = tf.less_equal(lhs_config.quant_config.bits, 8)
+      rhs_less_than = tf.less_equal(rhs_config.quant_config.bits, 8)
+      less_than_8 = lhs_less_than & rhs_less_than
       is_config_active = aqt_tensor.is_config_active(rhs_config, event_count)
 
-      is_valid &= (~is_config_active | (dilations is None)
-                   | rhs_config.quant_config.preserve_zero)
+      # if less_than_8 is False, then NOOP (&=True)
+      # else: check conditions
+      is_valid &= ~less_than_8 | (~is_config_active | (dilations is None)
+                                  | rhs_config.quant_config.preserve_zero)
 
   assert_op = tf.debugging.Assert(is_valid, [
       'rhs_config.quant_config.preserve_zero must be True if the filter is dilated.'
@@ -195,3 +198,65 @@ def conv2d(
 
       with tf.name_scope('inv_scale'):
         return conv * (input_inv_scale * filter_inv_scale)
+
+
+def depthwise_conv2d(
+    input_quantizer: aqt_tensor.TensorQuantizer,  #
+    input: tf.Tensor,  # pylint: disable=redefined-builtin
+    filter_quantizer: aqt_tensor.TensorQuantizer,
+    filter: tf.Tensor,  # pylint: disable=redefined-builtin
+    train: bool = True,
+    **tf_dw_conv2d_kwargs):
+  r"""Quantized :py:func:`tf.nn.depthwise_conv2d`.
+
+  Quantization is symmetric and uniform, with range determined by the
+  `config`. Otherwise, all arguments are passed on to
+  :py:func:`tf.nn.depthwise_conv2d`.
+
+  Args:
+    input_quantizer: TensorQuantizer for input
+    input: A `tf.Tensor`. Must be `float32`. The convolution input.
+    filter_quantizer: TensorQuantizer for filter
+    filter: A `tf.Tensor`. Must have the same type as `input`. The convolution
+      kernel.
+    train: if False, allows static switching for inference quantization
+      configuration, a performance optimization.
+    **tf_dw_conv2d_kwargs: Keyword arguments to pass onto `depthwise_conv2d`.
+
+  Returns:
+    A tensor of the same type as `input` conformal to what
+    `depthwise_conv2d` would return.
+  """
+  data_format = tf_dw_conv2d_kwargs.get('data_format', 'NHWC')
+  _validate_inputs(input_quantizer, filter_quantizer, data_format)
+  assert_op = _assert_dilation_argument(
+      input_quantizer, filter_quantizer,
+      tf_dw_conv2d_kwargs.get('dilations', None))
+
+  with tf.control_dependencies([assert_op]):
+    with tf.name_scope('AqtDepthwiseConv2d'):
+      with tf.name_scope('to_quant'):
+        with tf.name_scope('input'):
+          input = input_quantizer._to_quant(input, train)
+        with tf.name_scope('filter'):
+          filter = filter_quantizer._to_quant(filter, train)
+
+      # the quantized variables to a floating point format.
+      if input_quantizer.config.use_quantized_variable and not train:
+        input = tf.cast(input_quantizer.quantized_variable.read_value(),
+                        tf.float32)
+      if filter_quantizer.config.use_quantized_variable and not train:
+        filter = tf.cast(filter_quantizer.quantized_variable.read_value(),
+                         tf.float32)
+
+      with tf.name_scope('depthwise_conv2d'):
+        dw_conv = tf.nn.depthwise_conv2d(input, filter, **tf_dw_conv2d_kwargs)
+
+      with tf.name_scope('from_quant'):
+        with tf.name_scope('input'):
+          input_inv_scale = input_quantizer._from_quant_scale(train)
+        with tf.name_scope('filter'):
+          filter_inv_scale = filter_quantizer._from_quant_scale(train)
+
+      with tf.name_scope('inv_scale'):
+        return dw_conv * (input_inv_scale * filter_inv_scale)
