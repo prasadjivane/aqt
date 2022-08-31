@@ -213,6 +213,7 @@ def _matmul_case(lhs_quantizer, rhs_quantizer, lhs, rhs, train):
 def _validate_inputs(
     lhs_quantizer: aqt_tensor.TensorQuantizer,  #
     rhs_quantizer: aqt_tensor.TensorQuantizer,
+    grad_quantizer: Optional[aqt_tensor.TensorQuantizer],
 ):
   """Validates configs and inputs for matmul."""
 
@@ -242,12 +243,24 @@ def _validate_inputs(
         f'expected rhs matmul contraction axis (0) to be in '
         f'share_stats_axes={rhs_config.stats_config.share_stats_axes}')
 
+  if not grad_quantizer:
+    return
+  # Other quantizations are possible -- for now the only quantization we allow
+  # for the gradient is based on scalar scaling.
+  grad_config = grad_quantizer.config
+  if (0 not in grad_config.stats_config.share_stats_axes or
+      1 not in grad_config.stats_config.share_stats_axes):
+    raise aqt_config.ConfigError(
+        f'expected grad matmul axes (0, 1) to both be in '
+        f'share_stats_axes={rhs_config.stats_config.share_stats_axes}')
+
 
 def matmul(
     lhs_quantizer: aqt_tensor.TensorQuantizer,  #
     lhs: tf.Tensor,
     rhs_quantizer: aqt_tensor.TensorQuantizer,
     rhs: tf.Tensor,
+    grad_quantizer: Optional[aqt_tensor.TensorQuantizer] = None,
     train: bool = True) -> tf.Tensor:
   """Quantized tf.matmul.
 
@@ -265,6 +278,7 @@ def matmul(
     lhs: left-hand side of the matmul, with shape [B, C].
     rhs_quantizer: the tensor quantizer for rhs.
     rhs: right-hand side of the matmul, with shape [C, F].
+    grad_quantizer: Optional quantizer for the gradient, with shape [B, F].
     train: If false and `use_quantized_variable` in lhs_quantizer or
       rhs_quantizer, then this indicates `aqt_matmul` should use the quantized
       variable with the latest quantized, memorized from the most recent
@@ -282,7 +296,7 @@ def matmul(
 
   [1]: https://arxiv.org/abs/1308.3432
   """
-  _validate_inputs(lhs_quantizer, rhs_quantizer)
+  _validate_inputs(lhs_quantizer, rhs_quantizer, grad_quantizer)
 
   def fwd(lhs, rhs):
     with tf.name_scope('AqtMatMul'):
@@ -347,15 +361,32 @@ def matmul(
           lhs_scaled = lhs_scale * lhs
           rhs_scaled = rhs_scale * rhs
 
+          grad_inv_scale = tf.constant(1.0, dtype=grad.dtype)
+          if grad_quantizer:
+            with tf.name_scope('grad_quant'):
+              # Note: grad_scale is a scalar.
+              grad = grad * rhs_inv_scale * lhs_inv_scale
+              grad_scale, grad_inv_scale = grad_quantizer._get_quant_scale(
+                  train)
+              grad = grad * grad_scale  # Scalar.
+              grad = grad_quantizer._to_quant(grad, train)
+              grad = grad_inv_scale * grad
+
           with tf.name_scope('lhs'):
             qrhs = rhs_quantizer._to_quant(rhs_scaled, train)
-            lhs_bwd = tf.matmul(grad * rhs_inv_scale, tf.transpose(qrhs))
+            if grad_quantizer:
+              lhs_bwd = lhs_scale * tf.matmul(grad, tf.transpose(qrhs))
+            else:
+              lhs_bwd = tf.matmul(grad * rhs_inv_scale, tf.transpose(qrhs))
             lhs_bwd = tf.where_v2(
                 lhs_quantizer._clip_mask(lhs_scaled, train), 0.0, lhs_bwd)
 
           with tf.name_scope('rhs'):
             qlhs = lhs_quantizer._to_quant(lhs_scaled, train)
-            rhs_bwd = tf.matmul(tf.transpose(qlhs), grad * lhs_inv_scale)
+            if grad_quantizer:
+              rhs_bwd = rhs_scale * tf.matmul(tf.transpose(qlhs), grad)
+            else:
+              rhs_bwd = tf.matmul(tf.transpose(qlhs), grad * lhs_inv_scale)
             rhs_bwd = tf.where_v2(
                 rhs_quantizer._clip_mask(rhs_scaled, train), 0.0, rhs_bwd)
 
@@ -369,13 +400,16 @@ def matmul(
 class Matmul:
   """Encapsulates a quantized matmul op and calibration state."""
 
-  def __init__(self,
-               config: aqt_config.AqtMatmulConfig,
-               lhs_shape: Iterable[Optional[int]],
-               rhs_shape: Iterable[Optional[int]],
-               name: str = 'aqt',
-               lhs_name: str = 'lhs',
-               rhs_name: str = 'rhs'):
+  def __init__(
+      self,
+      config: aqt_config.AqtMatmulConfig,
+      lhs_shape: Iterable[Optional[int]],
+      rhs_shape: Iterable[Optional[int]],
+      name: str = 'aqt',
+      lhs_name: str = 'lhs',
+      rhs_name: str = 'rhs',
+      grad_name: str = 'grad',
+  ):
     """Creates a Matmul instance.
 
     This encapsulates the state necessary for quantizing both
@@ -388,20 +422,33 @@ class Matmul:
       name: variable scope for all variables to be created.
       lhs_name: scope for left hand side variables only.
       rhs_name: scope for right hand side variables only.
+      grad_name: scope for the grad variables only (if quantizing).
     """
     self.name = name
     self.lhs_name = lhs_name
     self.rhs_name = rhs_name
+    self.grad_name = grad_name
     with tf.variable_scope(name):
       self.lhs_quantizer = aqt_tensor.TensorQuantizer(
           lhs_shape, config.lhs, name=lhs_name)
       self.rhs_quantizer = aqt_tensor.TensorQuantizer(
           rhs_shape, config.rhs, name=rhs_name)
+      if config.grad:  # The gradient shape is inferred from the rhs and lhs.
+        grad_shape = [list(lhs_shape)[1], list(rhs_shape)[0]]
+        self.grad_quantizer = aqt_tensor.TensorQuantizer(
+            grad_shape, config.grad, name=grad_name)
+      else:
+        self.grad_quantizer = None
 
-    _validate_inputs(self.lhs_quantizer, self.rhs_quantizer)
+    _validate_inputs(self.lhs_quantizer, self.rhs_quantizer,
+                     self.grad_quantizer)
 
-  def update_lhs(self, x: tf.Tensor, weights: tf.Tensor,
-                 event_count: tf.Tensor) -> tf.Operation:
+  def update_lhs(
+      self,
+      x: tf.Tensor,
+      weights: tf.Tensor,
+      event_count: tf.Tensor,
+  ) -> tf.Operation:
     """Updates variables for an observation of the lhs.
 
     Updating variables for an argument updates the statistics
@@ -425,10 +472,26 @@ class Matmul:
     """
     return self.lhs_quantizer.update(x, weights, event_count)
 
-  def update_rhs(self, x: tf.Tensor, weights: tf.Tensor,
-                 event_count: tf.Tensor) -> tf.Operation:
+  def update_rhs(
+      self,
+      x: tf.Tensor,
+      weights: tf.Tensor,
+      event_count: tf.Tensor,
+  ) -> tf.Operation:
     """Computes analogue of update_lhs, but for rhs."""
     return self.rhs_quantizer.update(x, weights, event_count)
+
+  def update_grad(
+      self,
+      x: tf.Tensor,
+      weights: tf.Tensor,
+      event_count: tf.Tensor,
+  ) -> Optional[tf.Operation]:
+    """Computes analogue of update_lhs for grad (optional)."""
+    if self.grad_quantizer:
+      return self.grad_quantizer.update(x, weights, event_count)
+    else:
+      return None
 
   def apply(self,
             lhs: tf.Tensor,
@@ -450,25 +513,40 @@ class Matmul:
       with clip bounds derived from the current quantizer statistics.
     """
 
-    return matmul(self.lhs_quantizer, lhs, self.rhs_quantizer, rhs, train=train)
+    return matmul(
+        self.lhs_quantizer,
+        lhs,
+        self.rhs_quantizer,
+        rhs,
+        self.grad_quantizer,
+        train=train)
 
-  def diagnostics(self, lhs: tf.Tensor, rhs: tf.Tensor) -> Dict[str, tf.Tensor]:
+  def diagnostics(
+      self,
+      lhs: tf.Tensor,
+      rhs: tf.Tensor,
+      grad: Optional[tf.Tensor] = None,
+  ) -> Dict[str, tf.Tensor]:
     """Returns a dictionary from keys to diagnostic tensors.
 
     Args:
-      lhs: lhs argument to self.Apply, used for derving diangostics relative to
+      lhs: lhs argument to self.Apply, used for deriving diangostics relative to
         a given input.
       rhs: as above, but for rhs
+      grad: If specified, the gradient for deriving diagnostics.
 
     Returns:
       A dictionary with various quantization-related diagnostics,
       whose string keys are prefixed by self.name/self.{lhs,rhs}_name.
     """
     d = {}
-    for prefix, quantizer, argument in [
+    quantizers = [
         (self.lhs_name, self.lhs_quantizer, lhs),
-        (self.rhs_name, self.rhs_quantizer, rhs)
-    ]:
+        (self.rhs_name, self.rhs_quantizer, rhs),
+    ]
+    if self.grad_name and self.grad_quantizer and grad:
+      quantizers.append((self.grad_name, self.grad_quantizer, grad))
+    for prefix, quantizer, argument in quantizers:
       clipped_proportion = tf.cast(argument > quantizer.clip_range(),
                                    tf.float32)
       prefix = f'{self.name}/{prefix}'

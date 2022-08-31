@@ -42,6 +42,32 @@ def matmul_config(matmul):
                                     matmul.rhs_quantizer.config)
 
 
+def _generate_grad_settings():
+  return (
+      dict(
+          testcase_name="no_grad_quantization",
+          grad_config=None,
+          check_individual_entries=True,
+          minimum_rel_error=0.01,
+          maximum_rel_error=1.0,
+      ),
+      dict(  # Using low-bit quantization will degrade the error.
+          testcase_name="1_bit_grad_quantization",
+          grad_config=aqt_matmul_test_base._schedule_config(1, 100, (0, 1)),
+          check_individual_entries=False,
+          minimum_rel_error=1.0,
+          maximum_rel_error=None,
+      ),
+      dict(  # grad quantization here should not degrade the error by much.
+          testcase_name="16_bit_grad_quantization",
+          grad_config=aqt_matmul_test_base._schedule_config(16, 100, (0, 1)),
+          check_individual_entries=True,
+          minimum_rel_error=0.01,
+          maximum_rel_error=1.0,
+      ),
+  )
+
+
 class IntNarrowedMatMulTest(tf.test.TestCase, parameterized.TestCase):
 
   def test_chooses_right_matmul(self):
@@ -157,7 +183,14 @@ class MatmulTest(aqt_matmul_test_base.MatmulTest):
     with self.assertRaisesRegex(aqt_config.ConfigError, "lhs data shape"):
       mm.apply(lhs, rhs)
 
-  def test_grad_linearity(self):
+  @parameterized.named_parameters(*_generate_grad_settings())
+  def test_grad_linearity(
+      self,
+      grad_config,
+      check_individual_entries,
+      minimum_rel_error,
+      maximum_rel_error,
+  ):
     """Validates gradients are correct on basic example."""
     float_config_tc = aqt_config.AqtTensorConfig(
         freeze_scale_at_begin=True,
@@ -178,7 +211,7 @@ class MatmulTest(aqt_matmul_test_base.MatmulTest):
     rhs_ph = tf.placeholder(tf.float32, shape=rhs_shape)
     target_ph = tf.placeholder(tf.float32, shape=target_shape)
 
-    config = aqt_config.AqtMatmulConfig(lhs_config, rhs_config)
+    config = aqt_config.AqtMatmulConfig(lhs_config, rhs_config, grad_config)
     mm = aqt_matmul.Matmul(config, lhs_shape, rhs_shape)
 
     with self.cached_session() as sess, sess.as_default():
@@ -187,8 +220,10 @@ class MatmulTest(aqt_matmul_test_base.MatmulTest):
       event_count = tf.constant(0, tf.int64)
       updates = [
           mm.update_lhs(tf.ones(lhs_shape), None, event_count),
-          mm.update_rhs(tf.ones(rhs_shape), None, event_count)
+          mm.update_rhs(tf.ones(rhs_shape), None, event_count),
       ]
+      if grad_config:
+        updates.append(mm.update_grad(tf.ones(rhs_shape), None, event_count))
       with tf.control_dependencies(updates):
         aqt_mm = mm.apply(lhs_ph, rhs_ph)
 
@@ -211,13 +246,24 @@ class MatmulTest(aqt_matmul_test_base.MatmulTest):
         grad_factor = aqtd.ravel()
         float_grad = lhs.ravel() * grad_factor
         true_grad = aqt_grad.ravel()
+
         diff = np.abs(float_grad - true_grad)
         bucket_width = scale * 2 / 255
         for j, err in enumerate(diff):
-          self.assertLessEqual(
-              err,
-              bucket_width * abs(grad_factor),
-              msg=f"trial {i} position {j}")
+          if check_individual_entries:
+            with self.subTest("Individual entry errors"):
+              self.assertLessEqual(
+                  err,
+                  bucket_width * abs(grad_factor),
+                  msg=f"trial {i} position {j}")
+        if minimum_rel_error:
+          with self.subTest("Minimum overall error"):
+            self.assertGreaterEqual(
+                np.abs(np.sum(diff) / np.sum(float_grad)), minimum_rel_error)
+        if maximum_rel_error:
+          with self.subTest("Maximum overall error"):
+            self.assertLessEqual(
+                np.abs(np.sum(diff) / np.sum(float_grad)), maximum_rel_error)
 
   def test_diagnostics(self):
     mm, lhs, rhs = self.exact_int8_matmul_example()
